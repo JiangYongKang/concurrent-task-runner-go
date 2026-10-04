@@ -7,11 +7,12 @@ import (
 )
 
 // Stats 是 Runner 的计数快照。Submitted 为累计登记数，
-// Queued/Running 为当前在队/在跑的瞬时值，其余为各终态累计数。
+// Queued/Running/Retrying 为当前瞬时值，其余为各终态累计数。
 type Stats struct {
 	Submitted int64
 	Queued    int64
 	Running   int64
+	Retrying  int64 // 处于 retry_wait、等待下一次尝试的任务数
 	Succeeded int64
 	Failed    int64
 	Canceled  int64
@@ -38,8 +39,11 @@ type Runner struct {
 	running  map[string]*Task
 	nRunning int
 
+	nRetryWait int // 处于 retry_wait、等待定时器再准入的任务数（不占在途容量）
+
 	stats    Stats
 	shutdown bool
+	drained  bool          // 关闭流程已收尾：worker 可退出，不再接纳任何重试
 	stopCh   chan struct{} // 关闭开始时关闭，用于唤醒看门狗
 
 	wg        sync.WaitGroup
@@ -80,6 +84,10 @@ func (r *Runner) Submit(ctx context.Context, idemKey string, p Payload, fn Func)
 		return nil, newError("submit", CodeInvalidArgument, "fn must not be nil", nil)
 	}
 	fp := fingerprint(p)
+	retry, err := normalizeRetry(p.Retry)
+	if err != nil {
+		return nil, err
+	}
 
 	r.mu.Lock()
 	if existing, ok := r.store.get(idemKey); ok {
@@ -88,6 +96,21 @@ func (r *Runner) Submit(ctx context.Context, idemKey string, p Payload, fn Func)
 			r.mu.Unlock()
 			return &snap, newError("submit", CodeIdempotentConflict,
 				"idempotency key reused with a different payload", nil)
+		}
+		if existing.state.Status == StatusRejected {
+			// 瞬时容量/关闭拒绝不“毒化”幂等键：同内容重新提交登记为新任务，
+			// 重新走准入；旧任务的 rejected 终态已结算并计入统计，不受影响。
+			t := newTask(idemKey, fp, p, fn, retry)
+			r.store.put(idemKey, t)
+			r.stats.Submitted++
+			if err := r.admitLocked(t); err != nil {
+				snap := t.snapshot()
+				r.mu.Unlock()
+				return &snap, err
+			}
+			snap := t.snapshot()
+			r.mu.Unlock()
+			return &snap, nil
 		}
 		if existing.state.Status.IsTerminal() {
 			snap := existing.snapshot()
@@ -113,7 +136,7 @@ func (r *Runner) Submit(ctx context.Context, idemKey string, p Payload, fn Func)
 		return &snap, err
 	}
 
-	t := newTask(idemKey, fp, p, fn)
+	t := newTask(idemKey, fp, p, fn, retry)
 	r.store.putIfAbsent(idemKey, t)
 	r.stats.Submitted++
 	if err := r.admitLocked(t); err != nil {
@@ -141,6 +164,7 @@ func (r *Runner) Get(ctx context.Context, idemKey string) (*TaskState, bool) {
 // Cancel 请求取消任务。
 //
 //   - 排队中：立即结算为 canceled 并移出队列，绝不执行；
+//   - 重试等待中：立即停掉重试定时器并结算为 canceled，之后不再发起新尝试；
 //   - 执行中：立即结算为 canceled（此后不再有可观测的成功/失败结果），
 //     并通过任务 ctx 发出取消信号，业务函数应协作退出；
 //   - 已 canceled/rejected/aborted：幂等返回当前状态；
@@ -169,6 +193,9 @@ func (r *Runner) Cancel(ctx context.Context, idemKey string, reason string) (*Ta
 	if t.state.Status == StatusQueued {
 		r.removeFromQueueLocked(t)
 	}
+	if t.state.Status == StatusRetryWait {
+		r.stopRetryLocked(t)
+	}
 	r.settleLocked(t, StatusCanceled, nil, cause)
 	if t.cancel != nil {
 		t.cancel()
@@ -177,12 +204,23 @@ func (r *Runner) Cancel(ctx context.Context, idemKey string, reason string) (*Ta
 	return &snap, nil
 }
 
+// stopRetryLocked 停掉重试定时器并退出重试等待计数（调用方持锁，状态为 retry_wait）。
+func (r *Runner) stopRetryLocked(t *Task) {
+	if t.retryTimer != nil {
+		t.retryTimer.Stop()
+		t.retryTimer = nil
+	}
+	r.nRetryWait--
+}
+
 // Shutdown 优雅关闭（可重复调用，仅首次生效）。
 //
 //  1. 标记关闭，拒绝一切新提交；
-//  2. 排队中的任务立即结算为 canceled 并移出队列，不会执行；
-//  3. 对在跑任务发出 ctx 取消信号，并在 ShutdownGrace 宽限期内等待收敛；
-//  4. 宽限期（或传入 ctx）结束后仍在跑的任务结算为 aborted；
+//  2. 对在跑任务发出 ctx 取消信号（协作式任务可借此尽快收尾）；
+//  3. 宽限期（ShutdownGrace 或传入 ctx）内，已受理的排队任务继续被派发执行、
+//     重试等待中的任务到期后仍会重新准入执行，成功/失败结果如实保留；
+//  4. 宽限期结束仍未收敛的任务（在跑/排队/等待重试）统一结算为 aborted，
+//     重试定时器被停掉，之后不再发起任何新尝试；
 //  5. 每个任务只结算一次，结果保留可查；无视取消信号的任务其协程可能残留，
 //     但其晚到结果会被丢弃，不会再改变状态。
 func (r *Runner) Shutdown(ctx context.Context) error {
@@ -199,15 +237,8 @@ func (r *Runner) beginShutdown() {
 	r.shutdown = true
 	close(r.stopCh)
 
-	cause := newError("shutdown", CodeShuttingDown, "canceled while queued at shutdown", context.Canceled)
-	// 复制当前队列后统一移除并结算，避免边遍历边切片操作。
-	queued := append([]*Task(nil), r.queue...)
-	r.queue = r.queue[:0]
-	for _, t := range queued {
-		if !t.state.Status.IsTerminal() {
-			r.settleLocked(t, StatusCanceled, nil, cause)
-		}
-	}
+	// 对在跑任务发取消信号，促使协作式任务尽快收尾；
+	// 排队与重试等待中的任务不取消，留给宽限期排空执行。
 	for _, t := range r.running {
 		if t.cancel != nil {
 			t.cancel()
@@ -237,7 +268,7 @@ func (r *Runner) waitConvergence(ctx context.Context) {
 	}()
 
 	r.mu.Lock()
-	for r.nRunning > 0 {
+	for r.nRunning > 0 || len(r.queue) > 0 || r.nRetryWait > 0 {
 		if !nowFunc().Before(deadline) || ctx.Err() != nil {
 			break
 		}
@@ -248,7 +279,8 @@ func (r *Runner) waitConvergence(ctx context.Context) {
 
 func (r *Runner) finishShutdown() {
 	r.mu.Lock()
-	cause := newError("shutdown", CodeAborted, "still running after shutdown grace", context.DeadlineExceeded)
+	cause := newError("shutdown", CodeAborted, "not finished after shutdown grace", context.DeadlineExceeded)
+	// 宽限期结束：所有未收敛任务统一结算为 aborted，每任务恰好一次。
 	for _, t := range r.running {
 		if t.state.Status == StatusRunning {
 			r.settleLocked(t, StatusAborted, nil, cause)
@@ -257,6 +289,20 @@ func (r *Runner) finishShutdown() {
 			}
 		}
 	}
+	queued := append([]*Task(nil), r.queue...)
+	r.queue = r.queue[:0]
+	for _, t := range queued {
+		if !t.state.Status.IsTerminal() {
+			r.settleLocked(t, StatusAborted, nil, cause)
+		}
+	}
+	for _, t := range r.store.all() {
+		if t.state.Status == StatusRetryWait {
+			r.stopRetryLocked(t)
+			r.settleLocked(t, StatusAborted, nil, cause)
+		}
+	}
+	r.drained = true
 	allDone := r.nRunning == 0
 	r.cond.Broadcast()
 	r.mu.Unlock()
@@ -275,6 +321,7 @@ func (r *Runner) Stats() Stats {
 	s := r.stats
 	s.Queued = int64(len(r.queue))
 	s.Running = int64(r.nRunning)
+	s.Retrying = int64(r.nRetryWait)
 	return s
 }
 

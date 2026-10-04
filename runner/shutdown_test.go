@@ -92,7 +92,7 @@ func TestShutdownAbortAfterGrace(t *testing.T) {
 	}
 }
 
-func TestShutdownCancelsQueuedAndRejectsNew(t *testing.T) {
+func TestShutdownDrainsQueuedAndRejectsNew(t *testing.T) {
 	r := newManualRunner(t, Config{MaxWorkers: 1, MaxQueue: 4, ShutdownGrace: time.Second})
 	ctx := context.Background()
 
@@ -122,8 +122,8 @@ func TestShutdownCancelsQueuedAndRejectsNew(t *testing.T) {
 	// 关闭瞬间并发提交新任务，只可能有三种可解释结局：
 	//  1. 关闭开始后到达 -> shutting_down（rejected）；
 	//  2. 容量已满且 wait=0（1 running + 4 queue）-> queue_full（rejected）；
-	//  3. 关闭开始前恰好入队 -> 关闭时结算为 canceled。
-	// 不允许出现成功执行或结果丢失。
+	//  3. 关闭开始前恰好入队 -> 宽限期内被排空执行 -> succeeded。
+	// 不允许出现结果丢失或无法解释的结局。
 	const n = 20
 	type outcome struct {
 		state *TaskState
@@ -153,10 +153,10 @@ func TestShutdownCancelsQueuedAndRejectsNew(t *testing.T) {
 			}
 			rejected++
 		case "":
-			// 关闭前入队：关闭时必须结算为 canceled，绝不能成功执行。
+			// 关闭前入队：宽限期内被排空执行，应保留成功结果。
 			st, ok := r.Get(ctx, o.state.IdemKey)
-			if !ok || st.Status != StatusCanceled {
-				t.Fatalf("关闭前入队任务应收敛为 canceled，实际 %+v ok=%v", st, ok)
+			if !ok || st.Status != StatusSucceeded {
+				t.Fatalf("关闭前入队任务应在宽限期内执行成功，实际 %+v ok=%v", st, ok)
 			}
 			admitted++
 		default:
@@ -164,22 +164,23 @@ func TestShutdownCancelsQueuedAndRejectsNew(t *testing.T) {
 		}
 	}
 	judge(t, "shutdown-rejects-new", "关闭期间 20 个并发新提交",
-		fmt.Sprintf("rejected(shutting_down/queue_full)=%d admitted-then-canceled=%d", rejected, admitted),
-		"两类之和=20，无成功执行")
+		fmt.Sprintf("rejected(shutting_down/queue_full)=%d admitted-then-drained=%d", rejected, admitted),
+		"两类之和=20，无结果丢失")
 	if rejected+admitted != n {
 		t.Fatalf("结局总数应为 %d，实际 %d+%d", n, rejected, admitted)
 	}
 
+	// 排队任务在宽限期内被排空执行并保留成功结果。
 	for _, k := range []string{"q1", "q2"} {
 		s, _ := r.Get(ctx, k)
-		if s.Status != StatusCanceled {
-			t.Fatalf("排队任务 %s 应在关闭时取消，实际 %s", k, s.Status)
+		if s.Status != StatusSucceeded {
+			t.Fatalf("排队任务 %s 应在宽限期内执行成功，实际 %s", k, s.Status)
 		}
 	}
-	judge(t, "shutdown-queued-canceled", "q1/q2 状态",
-		statuses(r, "q1", "q2"), "canceled,canceled")
-	if atomic.LoadInt32(&queuedRan) != 0 {
-		t.Fatalf("排队任务在关闭时不得执行，实际执行 %d 次", queuedRan)
+	judge(t, "shutdown-queued-drained", "q1/q2 状态",
+		statuses(r, "q1", "q2"), "succeeded,succeeded")
+	if atomic.LoadInt32(&queuedRan) != 2 {
+		t.Fatalf("排队任务应在宽限期内各执行一次，实际执行 %d 次", queuedRan)
 	}
 
 	// 关闭后的提交一律拒绝。

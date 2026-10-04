@@ -116,17 +116,17 @@ func (r *Runner) startWorkers() {
 	}
 }
 
-// worker 从 FIFO 队列取任务执行；关闭且队列清空后退出。
+// worker 从 FIFO 队列取任务执行；关闭流程收尾（drained）且队列清空后退出。
 // 不变量：循环边界处 worker 始终持有 r.mu。
 func (r *Runner) worker(id int) {
 	defer r.wg.Done()
 	r.mu.Lock()
 	for {
-		for len(r.queue) == 0 && !r.shutdown {
+		for len(r.queue) == 0 && !r.drained {
 			r.cond.Wait()
 		}
 		if len(r.queue) == 0 {
-			// shutdown 已开始且队列被清空：本 worker 退出。
+			// 关闭已收尾且队列被清空：本 worker 退出。
 			r.mu.Unlock()
 			return
 		}
@@ -138,7 +138,7 @@ func (r *Runner) worker(id int) {
 		}
 		t.state.Status = StatusRunning
 		t.state.StartedAt = nowFunc()
-		t.state.Attempts = 1
+		t.state.Attempts++
 		ctx, cancel := context.WithCancel(context.Background())
 		t.cancel = cancel
 		r.running[t.idemKey] = t
@@ -152,6 +152,7 @@ func (r *Runner) worker(id int) {
 		r.mu.Lock()
 		delete(r.running, t.idemKey)
 		r.nRunning--
+		t.cancel = nil
 		r.cond.Broadcast()
 	}
 }
@@ -188,8 +189,101 @@ func (r *Runner) execute(ctx context.Context, t *Task) {
 			return
 		}
 		terr := newError("execute", CodeFailed, "task returned error", err)
+		if t.state.Attempts < t.retry.MaxAttempts && retryable(err) {
+			// 值得重试且次数未尽：转入 retry_wait，等待期间不占执行并发。
+			r.scheduleRetryLocked(t, terr)
+			return
+		}
 		r.settleLocked(t, StatusFailed, nil, terr)
 		return
 	}
 	r.settleLocked(t, StatusSucceeded, result, nil)
+}
+
+// scheduleRetryLocked 把本次失败但可重试的任务转入 retry_wait 并安排下一次尝试
+// （调用方持锁，当前状态为 running）。等待期间任务保持非终态，
+// 幂等重放与取消语义与执行中一致。
+func (r *Runner) scheduleRetryLocked(t *Task, cause *TaskError) {
+	t.state.Status = StatusRetryWait
+	t.state.Err = cause // 等待期间可观测最近一次失败原因
+	r.nRetryWait++
+	delay := t.retry.delay(t.state.Attempts)
+	t.retryTimer = time.AfterFunc(delay, func() { r.retryTimerFired(t) })
+}
+
+// retryTimerFired 是重试定时器到期回调。若任务已被取消/关闭结算，本次到期直接丢弃；
+// 否则尝试在容量约束内把任务重新准入执行。
+func (r *Runner) retryTimerFired(t *Task) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t.state.Status != StatusRetryWait {
+		return
+	}
+	t.retryTimer = nil
+	r.readmitLocked(t)
+}
+
+// readmitLocked 把 retry_wait 的任务重新放回 FIFO 队列（调用方持锁，状态为 retry_wait）。
+//
+// 重新进入执行仍受在途容量约束：容量满时按 MaxQueueWait 有界等待；
+// 等待期间任务可能被取消或关闭流程结算（状态不再是 retry_wait），立即放弃；
+// 超时仍无空位则结算为 failed(queue_timeout)——任务有确定结局，绝不无限等待。
+func (r *Runner) readmitLocked(t *Task) {
+	if r.inflightLocked() < r.capacity() {
+		r.requeueLocked(t)
+		return
+	}
+	if r.cfg.MaxQueueWait <= 0 {
+		r.failReadmitLocked(t)
+		return
+	}
+
+	deadline := nowFunc().Add(r.cfg.MaxQueueWait)
+	stopWatch := make(chan struct{})
+	defer close(stopWatch)
+	go func() {
+		d := time.Until(deadline)
+		if d < 0 {
+			d = 0
+		}
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			r.cond.Broadcast()
+		case <-r.stopCh:
+		case <-stopWatch:
+		}
+	}()
+
+	for r.inflightLocked() >= r.capacity() {
+		if t.state.Status != StatusRetryWait {
+			return // 等待期间已被取消/关闭结算
+		}
+		if !nowFunc().Before(deadline) {
+			r.failReadmitLocked(t)
+			return
+		}
+		r.cond.Wait()
+	}
+	if t.state.Status != StatusRetryWait {
+		return
+	}
+	r.requeueLocked(t)
+}
+
+// requeueLocked 结束重试等待并把任务放回 FIFO 队尾（调用方持锁，状态为 retry_wait）。
+func (r *Runner) requeueLocked(t *Task) {
+	r.nRetryWait--
+	t.state.Status = StatusQueued
+	r.enqueueLocked(t)
+}
+
+// failReadmitLocked 在容量窗口内无法重新准入时给出确定结局：failed(queue_timeout)。
+func (r *Runner) failReadmitLocked(t *Task) {
+	r.nRetryWait--
+	cause := newError("retry", CodeQueueTimeout,
+		fmt.Sprintf("retry could not re-enter execution within capacity window (capacity=%d, running=%d)",
+			r.capacity(), r.nRunning), nil)
+	r.settleLocked(t, StatusFailed, nil, cause)
 }

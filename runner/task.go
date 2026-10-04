@@ -9,13 +9,14 @@ import (
 type Status string
 
 const (
-	StatusQueued    Status = "queued"    // 已登记，等待执行
-	StatusRunning   Status = "running"   // 正在执行
-	StatusSucceeded Status = "succeeded" // 执行成功（终态）
-	StatusFailed    Status = "failed"    // 业务函数返回错误（终态）
-	StatusCanceled  Status = "canceled"  // 被用户取消或关闭时取消（终态）
-	StatusRejected  Status = "rejected"  // 因过载/关闭被拒绝（终态）
-	StatusAborted   Status = "aborted"   // 关闭宽限期后仍未结束（终态）
+	StatusQueued    Status = "queued"     // 已登记，等待执行
+	StatusRunning   Status = "running"    // 正在执行
+	StatusRetryWait Status = "retry_wait" // 上一次尝试失败，等待下一次重试（不占执行并发）
+	StatusSucceeded Status = "succeeded"  // 执行成功（终态）
+	StatusFailed    Status = "failed"     // 业务函数返回错误（终态，含重试耗尽）
+	StatusCanceled  Status = "canceled"   // 被用户取消或关闭时取消（终态）
+	StatusRejected  Status = "rejected"   // 因过载/关闭被拒绝（终态）
+	StatusAborted   Status = "aborted"    // 关闭宽限期后仍未结束（终态）
 )
 
 // IsTerminal 报告状态是否为终态。终态任务的结果与状态不再变化。
@@ -32,10 +33,13 @@ func (s Status) IsTerminal() bool {
 type Func func(ctx context.Context) (any, error)
 
 // Payload 是提交内容，参与幂等冲突判定：
-// 同一幂等键复用但 Name 或 Params 不同，视为冲突提交。
+// 同一幂等键复用但 Name、Params 或 Retry 不同，视为冲突提交。
 type Payload struct {
 	Name   string
 	Params any
+	// Retry 为可选重试策略；nil 表示不重试（保持上一版行为）。
+	// 它参与内容指纹：同键但策略不同同样构成幂等冲突。
+	Retry *RetryPolicy
 }
 
 // TaskState 是任务状态的可观测快照（值拷贝，可安全持有）。
@@ -47,8 +51,10 @@ type TaskState struct {
 	StartedAt   time.Time
 	FinishedAt  time.Time
 	Result      any
-	Err         *TaskError
-	Attempts    int
+	// Err 在终态时是结局原因；在 retry_wait 期间是最近一次尝试的失败原因，便于观察。
+	Err *TaskError
+	// Attempts 是已发起的尝试次数（含正在进行的一次）。
+	Attempts int
 }
 
 // Task 是内部任务记录。所有字段均由 Runner 的单一互斥锁保护，
@@ -57,17 +63,20 @@ type Task struct {
 	idemKey     string
 	fingerprint string // 提交内容指纹，用于冲突判定
 	fn          Func
+	retry       *RetryPolicy // 归一化后的重试策略，MaxAttempts>=1，永不为 nil
 	state       TaskState
 
-	cancel context.CancelFunc // 运行期取消函数；进入 running 前为 nil
-	done   chan struct{}      // 进入终态时关闭
+	cancel     context.CancelFunc // 运行期取消函数；进入 running 前为 nil
+	retryTimer *time.Timer        // retry_wait 期间的下一次尝试定时器
+	done       chan struct{}      // 进入终态时关闭
 }
 
-func newTask(idemKey, fingerprint string, p Payload, fn Func) *Task {
+func newTask(idemKey, fingerprint string, p Payload, fn Func, retry *RetryPolicy) *Task {
 	t := &Task{
 		idemKey:     idemKey,
 		fingerprint: fingerprint,
 		fn:          fn,
+		retry:       retry,
 		done:        make(chan struct{}),
 	}
 	t.state.ID = idemKey

@@ -26,6 +26,13 @@ func (s *store) putIfAbsent(key string, t *Task) (existing *Task, loaded bool) {
 	return t, false
 }
 
+// put 覆盖登记指定键的任务（调用方持 Runner 锁）。
+// 仅用于“rejected 终态 + 同内容重新提交”场景：旧任务已结算，
+// 用新任务替换登记，使瞬时容量拒绝不会永久占用幂等键。
+func (s *store) put(key string, t *Task) {
+	s.tasks[key] = t
+}
+
 // all 返回当前所有任务快照列表（调用方持 Runner 锁）。
 func (s *store) all() []*Task {
 	out := make([]*Task, 0, len(s.tasks))

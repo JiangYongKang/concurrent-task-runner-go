@@ -43,6 +43,7 @@ func main() {
 		overload  = flag.Bool("overload", false, "使用小容量制造过载，统计拒绝")
 		cancelPct = flag.Int("cancel-pct", 0, "随机取消已提交任务的百分比 0-100")
 		dupPct    = flag.Int("dup-pct", 0, "重复使用幂等键的百分比（测试幂等重放）0-100")
+		retryPct  = flag.Int("retry-pct", 0, "携带重试策略且前两次瞬时失败的任务百分比 0-100")
 	)
 	flag.Parse()
 
@@ -64,8 +65,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("配置: workers=%d queue=%d queueWait=%s grace=%s n=%d conc=%d work=%s GOMAXPROCS=%d\n",
-		*workers, *queue, *wait, *grace, *n, *conc, *work, runtime.GOMAXPROCS(0))
+	fmt.Printf("配置: workers=%d queue=%d queueWait=%s grace=%s n=%d conc=%d work=%s retry-pct=%d GOMAXPROCS=%d\n",
+		*workers, *queue, *wait, *grace, *n, *conc, *work, *retryPct, runtime.GOMAXPROCS(0))
 
 	latencies := make([]time.Duration, 0, *n)
 	var mu sync.Mutex
@@ -121,9 +122,23 @@ func main() {
 						payload.Params = int64(0)
 					}
 				}
+				// retryPct 概率携带重试策略：前两次返回可重试的瞬时失败，第三次成功。
+				useRetry := *retryPct > 0 && int(i%100) < *retryPct
+				if useRetry {
+					payload.Retry = &runner.RetryPolicy{
+						MaxAttempts: 3,
+						Interval:    2 * time.Millisecond,
+						Backoff:     runner.BackoffExponential,
+					}
+				}
+				var attempts int32
 				fn := func(ctx context.Context) (any, error) {
+					fail := useRetry && atomic.AddInt32(&attempts, 1) < 3
 					select {
 					case <-time.After(*work):
+						if fail {
+							return nil, fmt.Errorf("transient-%d", i)
+						}
 						return i, nil
 					case <-ctx.Done():
 						return nil, ctx.Err()
@@ -175,8 +190,8 @@ func main() {
 	fmt.Printf("  成功/重放=%d queue_full=%d queue_timeout=%d shutting_down=%d idempotent_conflict=%d other=%d (合计=%d)\n",
 		c.ok, c.rejectedFull, c.rejectedWait, c.shutting, c.conflict, c.other, total)
 	fmt.Println("服务端终态计数:")
-	fmt.Printf("  submitted=%d succeeded=%d failed=%d canceled=%d rejected=%d aborted=%d\n",
-		st.Submitted, st.Succeeded, st.Failed, st.Canceled, st.Rejected, st.Aborted)
+	fmt.Printf("  submitted=%d succeeded=%d failed=%d canceled=%d rejected=%d aborted=%d (关闭后 retrying=%d)\n",
+		st.Submitted, st.Succeeded, st.Failed, st.Canceled, st.Rejected, st.Aborted, st.Retrying)
 
 	// 自洽性校验：所有终态计数之和应等于累计登记数，保证无结果丢失/重复结算。
 	tracked := st.Succeeded + st.Failed + st.Canceled + st.Rejected + st.Aborted
@@ -184,7 +199,11 @@ func main() {
 		fmt.Fprintf(os.Stderr, "不一致: 终态合计=%d 但登记=%d\n", tracked, st.Submitted)
 		os.Exit(2)
 	}
-	fmt.Println("一致性校验: 终态合计 == 登记数 ✓")
+	if st.Retrying != 0 {
+		fmt.Fprintf(os.Stderr, "不一致: 关闭后仍有 %d 个任务处于重试等待\n", st.Retrying)
+		os.Exit(2)
+	}
+	fmt.Println("一致性校验: 终态合计 == 登记数 ✓ 关闭后无残留重试等待 ✓")
 }
 
 func classify(c *counters, err error) {
