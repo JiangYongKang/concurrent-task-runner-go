@@ -75,6 +75,72 @@ func (r *Runner) enqueueLocked(t *Task) {
 	r.cond.Broadcast()
 }
 
+// scheduleRetryLocked 把一次可重试失败安排为下一轮尝试（调用方持锁）。
+// 等待期间任务处于 retry_wait：不占执行并发、不在队列，但仍是进行中的同一次提交。
+func (r *Runner) scheduleRetryLocked(t *Task, cause error) {
+	delay := t.policy.delay(t.state.Attempts)
+	t.state.Status = StatusRetryWait
+	t.state.Err = newError("execute", CodeFailed, "attempt failed, retry scheduled", cause)
+	t.state.NextRetryAt = nowFunc().Add(delay)
+	r.nRetryWait++
+	t.retryTimer = time.AfterFunc(delay, func() { r.onRetryDue(t) })
+}
+
+// onRetryDue 由重试定时器触发：到点后把任务标记为待晋升并尝试按容量入队。
+func (r *Runner) onRetryDue(t *Task) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t.state.Status != StatusRetryWait || t.retryDue {
+		return // 已被取消/关闭打断，或定时器重复触发
+	}
+	t.retryDue = true
+	r.retryDue = append(r.retryDue, t)
+	r.promoteDueLocked()
+}
+
+// promoteDueLocked 在容量允许时把到点的重试任务重新入队（调用方持锁）。
+// 容量不足时任务留在 retry_wait，待容量释放后由 worker 循环再次晋升，
+// 不会长期卡住：容量随在途任务结算而释放，关闭时由关闭流程统一处理。
+func (r *Runner) promoteDueLocked() {
+	for len(r.retryDue) > 0 && r.inflightLocked() < r.capacity() {
+		t := r.retryDue[0]
+		r.retryDue = r.retryDue[1:]
+		if t.state.Status != StatusRetryWait {
+			t.retryDue = false
+			continue
+		}
+		t.retryDue = false
+		t.state.Status = StatusQueued
+		t.state.NextRetryAt = time.Time{}
+		r.nRetryWait--
+		r.enqueueLocked(t)
+	}
+}
+
+// stopRetryWaitLocked 使任务退出 retry_wait 状态：停定时器并移出待晋升队列。
+// 返回任务是否确实处于 retry_wait。
+func (r *Runner) stopRetryWaitLocked(t *Task) bool {
+	if t.state.Status != StatusRetryWait {
+		return false
+	}
+	if t.retryTimer != nil {
+		t.retryTimer.Stop()
+		t.retryTimer = nil
+	}
+	if t.retryDue {
+		t.retryDue = false
+		for i, x := range r.retryDue {
+			if x == t {
+				r.retryDue = append(r.retryDue[:i], r.retryDue[i+1:]...)
+				break
+			}
+		}
+	}
+	t.state.NextRetryAt = time.Time{}
+	r.nRetryWait--
+	return true
+}
+
 // rejectLocked 将任务结算为 rejected（仅登记不入队），不占用执行资源。
 func (r *Runner) rejectLocked(t *Task, code Code, msg string) error {
 	err := newError("submit", code, msg, nil)
@@ -122,8 +188,11 @@ func (r *Runner) worker(id int) {
 	defer r.wg.Done()
 	r.mu.Lock()
 	for {
+		// 容量可能已于上次结算时释放：先晋升到点的重试任务。
+		r.promoteDueLocked()
 		for len(r.queue) == 0 && !r.shutdown {
 			r.cond.Wait()
+			r.promoteDueLocked()
 		}
 		if len(r.queue) == 0 {
 			// shutdown 已开始且队列被清空：本 worker 退出。
@@ -138,7 +207,8 @@ func (r *Runner) worker(id int) {
 		}
 		t.state.Status = StatusRunning
 		t.state.StartedAt = nowFunc()
-		t.state.Attempts = 1
+		t.state.Attempts++
+		t.state.NextRetryAt = time.Time{}
 		ctx, cancel := context.WithCancel(context.Background())
 		t.cancel = cancel
 		r.running[t.idemKey] = t
@@ -185,6 +255,12 @@ func (r *Runner) execute(ctx context.Context, t *Task) {
 			cause := newError("execute", CodeTaskCanceled,
 				"task exited after cancel signal", context.Canceled)
 			r.settleLocked(t, StatusCanceled, nil, cause)
+			return
+		}
+		// 可重试失败且仍有剩余次数：安排下一轮尝试（关闭期间不再发起新尝试）。
+		if !r.shutdown && t.policy.enabled() &&
+			t.state.Attempts < t.policy.MaxAttempts && IsRetryable(err) {
+			r.scheduleRetryLocked(t, err)
 			return
 		}
 		terr := newError("execute", CodeFailed, "task returned error", err)

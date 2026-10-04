@@ -38,6 +38,9 @@ type Runner struct {
 	running  map[string]*Task
 	nRunning int
 
+	retryDue   []*Task // 重试定时已到点、等待容量晋升的任务（FIFO）
+	nRetryWait int     // 处于 retry_wait 状态的任务数（含已到点待晋升者）
+
 	stats    Stats
 	shutdown bool
 	stopCh   chan struct{} // 关闭开始时关闭，用于唤醒看门狗
@@ -63,16 +66,37 @@ func New(cfg Config) (*Runner, error) {
 	return r, nil
 }
 
-// Submit 提交任务。
+// Submit 提交任务（不重试，等价于 SubmitWithRetry 传入零值 RetryPolicy）。
 //
 // 幂等语义：
 //   - idemKey 首次出现：登记并尝试在有界容量内执行；
 //   - 相同 idemKey + 相同 Payload：不重复执行，返回同一任务的最终/当前状态；
 //   - 相同 idemKey + 不同 Payload：返回 CodeIdempotentConflict，原任务不受影响；
-//   - 对已终结任务的重复提交直接重放其结果（成功无错；拒绝类终态返回当时的失败原因）。
+//   - 对已终结任务的重复提交直接重放其结果（成功无错；拒绝类终态返回当时的失败原因），
+//     但因容量不足（queue_full/queue_timeout）被拒的任务允许同内容再次提交并重新执行。
 //
 // 并发重复提交且任务尚未终结时，调用会阻塞至任务终结或 ctx 取消。
 func (r *Runner) Submit(ctx context.Context, idemKey string, p Payload, fn Func) (*TaskState, error) {
+	return r.submit(ctx, idemKey, p, fn, RetryPolicy{})
+}
+
+// SubmitWithRetry 提交任务并指定自动重试策略。
+//
+// 除重试外语义与 Submit 完全一致（同一幂等登记表、同一容量约束）：
+//   - 仅当任务函数返回被 Retryable 标记的错误时才安排下一轮尝试；
+//   - 两次尝试之间的等待不占执行并发，任务对外处于 retry_wait（进行中）；
+//   - 等待期间的同键同内容提交复用同一任务（阻塞等待最终结局）；
+//   - 尝试次数耗尽后以 failed 终结，TaskState.Attempts 记录总尝试次数，
+//     TaskState.Err 为最后一次失败原因。
+func (r *Runner) SubmitWithRetry(ctx context.Context, idemKey string, p Payload, fn Func, policy RetryPolicy) (*TaskState, error) {
+	np, err := policy.normalize()
+	if err != nil {
+		return nil, err
+	}
+	return r.submit(ctx, idemKey, p, fn, np)
+}
+
+func (r *Runner) submit(ctx context.Context, idemKey string, p Payload, fn Func, policy RetryPolicy) (*TaskState, error) {
 	if idemKey == "" {
 		return nil, newError("submit", CodeInvalidArgument, "idemKey must not be empty", nil)
 	}
@@ -90,6 +114,22 @@ func (r *Runner) Submit(ctx context.Context, idemKey string, p Payload, fn Func)
 				"idempotency key reused with a different payload", nil)
 		}
 		if existing.state.Status.IsTerminal() {
+			if revivableReject(existing) {
+				// 瞬时容量不足（queue_full/queue_timeout）的被拒任务：
+				// 同内容再次提交时以新记录替换重新登记执行，
+				// 该幂等键不会因一次瞬时拒绝而永久不可用。
+				t := newTask(idemKey, fp, p, fn, policy)
+				r.store.put(idemKey, t)
+				r.stats.Submitted++
+				if err := r.admitLocked(t); err != nil {
+					snap := t.snapshot()
+					r.mu.Unlock()
+					return &snap, err
+				}
+				snap := t.snapshot()
+				r.mu.Unlock()
+				return &snap, nil
+			}
 			snap := existing.snapshot()
 			err := terminalCause(existing)
 			r.mu.Unlock()
@@ -113,7 +153,7 @@ func (r *Runner) Submit(ctx context.Context, idemKey string, p Payload, fn Func)
 		return &snap, err
 	}
 
-	t := newTask(idemKey, fp, p, fn)
+	t := newTask(idemKey, fp, p, fn, policy)
 	r.store.putIfAbsent(idemKey, t)
 	r.stats.Submitted++
 	if err := r.admitLocked(t); err != nil {
@@ -141,6 +181,8 @@ func (r *Runner) Get(ctx context.Context, idemKey string) (*TaskState, bool) {
 // Cancel 请求取消任务。
 //
 //   - 排队中：立即结算为 canceled 并移出队列，绝不执行；
+//   - 重试等待中（retry_wait）：立即停止等待定时器并结算为 canceled，
+//     之后不再发起新的尝试；
 //   - 执行中：立即结算为 canceled（此后不再有可观测的成功/失败结果），
 //     并通过任务 ctx 发出取消信号，业务函数应协作退出；
 //   - 已 canceled/rejected/aborted：幂等返回当前状态；
@@ -168,6 +210,8 @@ func (r *Runner) Cancel(ctx context.Context, idemKey string, reason string) (*Ta
 	cause := newError("cancel", CodeTaskCanceled, "canceled: "+reason, context.Canceled)
 	if t.state.Status == StatusQueued {
 		r.removeFromQueueLocked(t)
+	} else {
+		r.stopRetryWaitLocked(t) // retry_wait：停表并移出待晋升队列
 	}
 	r.settleLocked(t, StatusCanceled, nil, cause)
 	if t.cancel != nil {
@@ -180,10 +224,13 @@ func (r *Runner) Cancel(ctx context.Context, idemKey string, reason string) (*Ta
 // Shutdown 优雅关闭（可重复调用，仅首次生效）。
 //
 //  1. 标记关闭，拒绝一切新提交；
-//  2. 排队中的任务立即结算为 canceled 并移出队列，不会执行；
-//  3. 对在跑任务发出 ctx 取消信号，并在 ShutdownGrace 宽限期内等待收敛；
-//  4. 宽限期（或传入 ctx）结束后仍在跑的任务结算为 aborted；
-//  5. 每个任务只结算一次，结果保留可查；无视取消信号的任务其协程可能残留，
+//  2. 从未开始执行的排队任务立即结算为 canceled 并移出队列，不会执行；
+//  3. 已进入重试周期的任务（retry_wait 等待中或重试再入队）立即停止等待、
+//     视为到点，在 ShutdownGrace 宽限期内随在跑任务一起尽量执行完，
+//     保留其成功/失败结果；宽限期内不再安排新的重试轮次；
+//  4. 对在跑任务发出 ctx 取消信号，并在宽限期（或传入 ctx）内等待收敛；
+//  5. 宽限期结束后仍在跑/仍未收敛的任务结算为 aborted；
+//  6. 每个任务只结算一次，结果保留可查；无视取消信号的任务其协程可能残留，
 //     但其晚到结果会被丢弃，不会再改变状态。
 func (r *Runner) Shutdown(ctx context.Context) error {
 	r.closeOnce.Do(func() {
@@ -200,12 +247,27 @@ func (r *Runner) beginShutdown() {
 	close(r.stopCh)
 
 	cause := newError("shutdown", CodeShuttingDown, "canceled while queued at shutdown", context.Canceled)
-	// 复制当前队列后统一移除并结算，避免边遍历边切片操作。
+	// 复制当前队列后统一处理，避免边遍历边切片操作。
 	queued := append([]*Task(nil), r.queue...)
 	r.queue = r.queue[:0]
 	for _, t := range queued {
-		if !t.state.Status.IsTerminal() {
+		if t.state.Status.IsTerminal() {
+			continue
+		}
+		if t.state.Attempts == 0 {
+			// 从未开始执行的排队任务：保持原语义，立即取消。
 			r.settleLocked(t, StatusCanceled, nil, cause)
+			continue
+		}
+		// 重试再入队的任务（已至少尝试一次）：留在队首，宽限期内尽量执行完。
+		r.queue = append(r.queue, t)
+	}
+	// 重试等待中的任务：停止等待定时器、立即到点入队，在宽限期内尽量执行完。
+	for _, t := range r.store.all() {
+		if t.state.Status == StatusRetryWait {
+			r.stopRetryWaitLocked(t)
+			t.state.Status = StatusQueued
+			r.queue = append(r.queue, t)
 		}
 	}
 	for _, t := range r.running {
@@ -237,7 +299,7 @@ func (r *Runner) waitConvergence(ctx context.Context) {
 	}()
 
 	r.mu.Lock()
-	for r.nRunning > 0 {
+	for r.nRunning > 0 || len(r.queue) > 0 || r.nRetryWait > 0 {
 		if !nowFunc().Before(deadline) || ctx.Err() != nil {
 			break
 		}
@@ -255,6 +317,20 @@ func (r *Runner) finishShutdown() {
 			if t.cancel != nil {
 				t.cancel()
 			}
+		}
+	}
+	// 宽限期内未能收敛的重试再入队/重试等待任务：统一标记为未完成。
+	queuedCause := newError("shutdown", CodeAborted, "not finished within shutdown grace", context.DeadlineExceeded)
+	for _, t := range r.queue {
+		if !t.state.Status.IsTerminal() {
+			r.settleLocked(t, StatusAborted, nil, queuedCause)
+		}
+	}
+	r.queue = r.queue[:0]
+	for _, t := range r.store.all() {
+		if t.state.Status == StatusRetryWait {
+			r.stopRetryWaitLocked(t)
+			r.settleLocked(t, StatusAborted, nil, queuedCause)
 		}
 	}
 	allDone := r.nRunning == 0
@@ -290,6 +366,16 @@ func (r *Runner) removeFromQueueLocked(target *Task) {
 			return
 		}
 	}
+}
+
+// revivableReject 报告终态任务是否为“瞬时容量不足”导致的拒绝。
+// 此类拒绝不代表业务结局，允许同内容再次提交时重新登记执行；
+// 其余终态（含 shutting_down 拒绝）保持终态不变、仅重放结果。
+func revivableReject(t *Task) bool {
+	if t.state.Status != StatusRejected || t.state.Err == nil {
+		return false
+	}
+	return t.state.Err.Code == CodeQueueFull || t.state.Err.Code == CodeQueueTimeout
 }
 
 // terminalCause 返回终态任务应重放给提交者的错误（成功为 nil）。

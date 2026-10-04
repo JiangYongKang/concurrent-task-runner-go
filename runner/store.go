@@ -26,6 +26,12 @@ func (s *store) putIfAbsent(key string, t *Task) (existing *Task, loaded bool) {
 	return t, false
 }
 
+// put 以新记录替换键下的旧记录（用于瞬时拒绝后的同内容重新提交）。
+// 旧记录已终结且不再被引用，替换不影响其已重放给调用方的结果。
+func (s *store) put(key string, t *Task) {
+	s.tasks[key] = t
+}
+
 // all 返回当前所有任务快照列表（调用方持 Runner 锁）。
 func (s *store) all() []*Task {
 	out := make([]*Task, 0, len(s.tasks))

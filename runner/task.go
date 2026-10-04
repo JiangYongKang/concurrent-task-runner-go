@@ -9,13 +9,14 @@ import (
 type Status string
 
 const (
-	StatusQueued    Status = "queued"    // 已登记，等待执行
-	StatusRunning   Status = "running"   // 正在执行
-	StatusSucceeded Status = "succeeded" // 执行成功（终态）
-	StatusFailed    Status = "failed"    // 业务函数返回错误（终态）
-	StatusCanceled  Status = "canceled"  // 被用户取消或关闭时取消（终态）
-	StatusRejected  Status = "rejected"  // 因过载/关闭被拒绝（终态）
-	StatusAborted   Status = "aborted"   // 关闭宽限期后仍未结束（终态）
+	StatusQueued    Status = "queued"     // 已登记，等待执行
+	StatusRunning   Status = "running"    // 正在执行
+	StatusRetryWait Status = "retry_wait" // 两次尝试之间等待（不占执行并发，仍属进行中）
+	StatusSucceeded Status = "succeeded"  // 执行成功（终态）
+	StatusFailed    Status = "failed"     // 业务函数返回错误（终态）
+	StatusCanceled  Status = "canceled"   // 被用户取消或关闭时取消（终态）
+	StatusRejected  Status = "rejected"   // 因过载/关闭被拒绝（终态）
+	StatusAborted   Status = "aborted"    // 关闭宽限期后仍未结束（终态）
 )
 
 // IsTerminal 报告状态是否为终态。终态任务的结果与状态不再变化。
@@ -48,7 +49,8 @@ type TaskState struct {
 	FinishedAt  time.Time
 	Result      any
 	Err         *TaskError
-	Attempts    int
+	Attempts    int       // 已发起的尝试次数（含首次）
+	NextRetryAt time.Time // 处于 retry_wait 时为下一次尝试的预定时间，否则为零值
 }
 
 // Task 是内部任务记录。所有字段均由 Runner 的单一互斥锁保护，
@@ -57,17 +59,21 @@ type Task struct {
 	idemKey     string
 	fingerprint string // 提交内容指纹，用于冲突判定
 	fn          Func
+	policy      RetryPolicy // 归一化后的重试策略；MaxAttempts<=1 表示不重试
 	state       TaskState
 
-	cancel context.CancelFunc // 运行期取消函数；进入 running 前为 nil
-	done   chan struct{}      // 进入终态时关闭
+	cancel     context.CancelFunc // 运行期取消函数；进入 running 前为 nil
+	done       chan struct{}      // 进入终态时关闭
+	retryTimer *time.Timer        // retry_wait 期间的定时器；离开该状态时停止
+	retryDue   bool               // 定时已到点、正在等待容量晋升
 }
 
-func newTask(idemKey, fingerprint string, p Payload, fn Func) *Task {
+func newTask(idemKey, fingerprint string, p Payload, fn Func, policy RetryPolicy) *Task {
 	t := &Task{
 		idemKey:     idemKey,
 		fingerprint: fingerprint,
 		fn:          fn,
+		policy:      policy,
 		done:        make(chan struct{}),
 	}
 	t.state.ID = idemKey

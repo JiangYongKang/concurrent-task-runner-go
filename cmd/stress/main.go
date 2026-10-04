@@ -43,6 +43,7 @@ func main() {
 		overload  = flag.Bool("overload", false, "使用小容量制造过载，统计拒绝")
 		cancelPct = flag.Int("cancel-pct", 0, "随机取消已提交任务的百分比 0-100")
 		dupPct    = flag.Int("dup-pct", 0, "重复使用幂等键的百分比（测试幂等重放）0-100")
+		retryPct  = flag.Int("retry-pct", 0, "携带重试策略且首次可重试失败的任务百分比 0-100")
 	)
 	flag.Parse()
 
@@ -64,8 +65,8 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Printf("配置: workers=%d queue=%d queueWait=%s grace=%s n=%d conc=%d work=%s GOMAXPROCS=%d\n",
-		*workers, *queue, *wait, *grace, *n, *conc, *work, runtime.GOMAXPROCS(0))
+	fmt.Printf("配置: workers=%d queue=%d queueWait=%s grace=%s n=%d conc=%d work=%s retry-pct=%d GOMAXPROCS=%d\n",
+		*workers, *queue, *wait, *grace, *n, *conc, *work, *retryPct, runtime.GOMAXPROCS(0))
 
 	latencies := make([]time.Duration, 0, *n)
 	var mu sync.Mutex
@@ -121,7 +122,13 @@ func main() {
 						payload.Params = int64(0)
 					}
 				}
+				// retryPct 概率携带重试策略：首次尝试以可重试错误失败，随后成功。
+				useRetry := *retryPct > 0 && int(i%100) < *retryPct
+				var calls int32
 				fn := func(ctx context.Context) (any, error) {
+					if useRetry && atomic.AddInt32(&calls, 1) == 1 {
+						return nil, runner.Retryable(fmt.Errorf("transient-%d", i))
+					}
 					select {
 					case <-time.After(*work):
 						return i, nil
@@ -130,7 +137,17 @@ func main() {
 					}
 				}
 				t0 := time.Now()
-				_, err := r.Submit(ctx, key, payload, fn)
+				var err error
+				if useRetry {
+					_, err = r.SubmitWithRetry(ctx, key, payload, fn, runner.RetryPolicy{
+						MaxAttempts: 3,
+						Interval:    2 * time.Millisecond,
+						Backoff:     runner.BackoffExponential,
+						MaxInterval: 10 * time.Millisecond,
+					})
+				} else {
+					_, err = r.Submit(ctx, key, payload, fn)
+				}
 				d := time.Since(t0)
 				mu.Lock()
 				latencies = append(latencies, d)
